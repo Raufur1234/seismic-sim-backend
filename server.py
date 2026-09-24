@@ -4,7 +4,7 @@ Parameters sliders.
 
 This is a trimmed mirror of the main project's server.py, deployed
 separately (Render) since GitHub Pages can only serve static files and
-can't run this Flask app itself. It exposes only POST /compute -- the
+can't run this Flask app itself. It exposes only POST /compute and POST /design -- the
 frontend (served from GitHub Pages) fetches everything else (index.html,
 out/*.json, out/*.csv, folders.json) directly from Pages, same-origin,
 with no involvement from this backend at all.
@@ -29,6 +29,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+from code_design import DesignError, DesignInput, generate_design
+
 from mdof_response import (
     MDOF_ShearBuilding, FURNITURE_CLASSES, BEAM_WIDTH,
     plan_dims_from_area, DEFAULT_AREA_SQFT, SQM_PER_SQFT,
@@ -41,6 +43,7 @@ from mdof_response import (
     finite_or_none, furniture_decimation, accumulated_damage,
     subsample_nearest, DAMAGE_CODES, DAMAGE_CODE_OF_BRANCH,
     DRIFT_LIMIT_IO, DRIFT_LIMIT_LS,
+    _HFTDConvolution, RHO_LONGITUDINAL,
 )
 
 # Spec 14 A1: optional per-story damage blocks, in WIRE order -- every
@@ -63,8 +66,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(PROJECT_ROOT, "out")
 
 app = Flask(__name__, static_folder=None)
-CORS(app, resources={r"/compute": {"origins": "https://nekrei.github.io",
-                                   "methods": ["POST", "OPTIONS"]}})
+CORS(app, resources={r"/(compute|design)": {"origins": "https://nekrei.github.io",
+                                           "methods": ["POST", "OPTIONS"]}})
 
 # Ground motion (acceleration + displacement) doesn't change with building
 # parameters, so cache each record's parsed ground_accel.json in memory
@@ -73,6 +76,8 @@ _ground_cache = {}
 
 
 def _load_ground(record):
+    if not isinstance(record, str) or os.path.basename(record) != record:
+        raise FileNotFoundError(f"No cached ground motion for record {record!r}")
     if record in _ground_cache:
         return _ground_cache[record]
     path = os.path.join(OUT_DIR, record, "ground_accel.json")
@@ -98,6 +103,44 @@ def _y_or_none(has_y, building_y, attr):
     return getattr(building_y, attr).tolist()
 
 
+def _identity_spectra(building, result, axes, segment_seconds=None):
+    """Independently rebuild the pseudo-force correction on its solve grid.
+
+    The elastic base and nonlinear correction deliberately use different FFT
+    padding in the solver. Their *trimmed* histories share physical sample
+    times; transforming those onto a common display grid makes the two-term
+    identity testable as complex values without pretending the operators had
+    one original padded grid.
+    """
+    grid = result.solve_grid
+    force, base, actual = grid["force"], grid["base"], grid["u"]
+    n = actual.shape[1]
+    convolution = _HFTDConvolution(building, n, grid["dt"], segment_seconds)
+    correction, _, _ = convolution.apply(force)
+    nfft = 1 << (n - 1).bit_length()
+    U = np.fft.rfft(actual, n=nfft, axis=1)
+    E = np.fft.rfft(base, n=nfft, axis=1)
+    C = np.fft.rfft(correction, n=nfft, axis=1)
+    scale = max(float(np.max(abs(U))), 1e-30)
+    closure = float(np.max(abs(U - E - C)) / scale)
+    elastic_error = float(np.max(abs(U - E)) / scale)
+    raw_f = np.fft.rfftfreq(nfft, grid["dt"])
+    f_hz = np.geomspace(.1, min(50., raw_f[-1]), 200)
+    nearest = np.searchsorted(raw_f, f_hz)
+    nearest = np.clip(nearest, 1, len(raw_f)-1)
+    nearest -= abs(raw_f[nearest-1]-f_hz) < abs(raw_f[nearest]-f_hz)
+    curves = {}
+    for axis, row in axes.items():
+        block = slice(row, row + building.N)
+        curves[axis] = dict(
+            measured=(abs(U[block][:, nearest])*grid["dt"]).tolist(),
+            elastic=(abs(E[block][:, nearest])*grid["dt"]).tolist(),
+            corrected=(abs((E+C)[block][:, nearest])*grid["dt"]).tolist(),
+        )
+    return dict(f_Hz=f_hz.tolist(), axes=curves, complex_residual=closure,
+                elastic_discrepancy=elastic_error, sampling_factor=grid["factor"])
+
+
 from mdof_response import HFTD_DEFAULTS, build_backbones
 
 
@@ -110,9 +153,17 @@ class ParamError(ValueError):
     completely plausibly on screen (spec 10, C2/E)."""
 
 
+# The same bounds _validate_params clamps the scalar values to. A profile
+# entry outside them is rejected rather than clamped (see ParamError).
+PROFILE_BOUNDS = {"story_height_profile": (1.5, 10.0),
+                  "column_depth_x_profile": (0.15, 2.0),
+                  "column_depth_y_profile": (0.15, 2.0),
+                  "beam_depth_profile": (0.10, 3.0)}
+
+
 def _validate_profile(body, key, num_stories):
-    """A per-floor profile: absent/null, or exactly `num_stories` finite,
-    strictly positive floats. Never truncated, never padded."""
+    """A per-floor profile: absent/null, or exactly `num_stories` finite
+    floats inside PROFILE_BOUNDS. Never truncated, never padded."""
     raw = body.get(key)
     if raw is None:
         return None
@@ -128,9 +179,10 @@ def _validate_profile(body, key, num_stories):
             f = float(v)
         except (TypeError, ValueError):
             raise ParamError(f"{key}[{i}] is not a number: {v!r}") from None
-        if not np.isfinite(f) or f <= 0.0:
-            raise ParamError(f"{key}[{i}] must be finite and strictly "
-                             f"positive, got {v!r}")
+        low, high = PROFILE_BOUNDS[key]
+        if not np.isfinite(f) or not low <= f <= high:
+            raise ParamError(f"{key}[{i}] must be finite and within "
+                             f"[{low}, {high}], got {v!r}")
         out.append(f)
     return out
 
@@ -241,16 +293,26 @@ def _validate_params(body, reference_magnitude=6.0):
     area_sqft (spec 8) is clamped to 200-2000, the same "sane bounds"
     reasoning as the column/beam depths -- it drives plan_span_x/y via
     plan_dims_from_area(), which in turn is the beam span L fed into K."""
+    def number(key, default):
+        # min()/max() pass NaN through to a bound instead of rejecting it.
+        value = float(body.get(key, default))
+        if not np.isfinite(value):
+            raise ParamError(f"{key} must be finite")
+        return value
+
     num_stories = max(1, min(30, int(body.get("num_stories", 7))))
-    mass_per_floor = max(1e3, min(1e8, float(body.get("mass_per_floor", 1000e3))))
-    zeta = max(0.005, min(0.5, float(body.get("zeta", 0.05))))
-    column_depth_x = max(0.15, min(2.0, float(body.get("column_depth_x", DEFAULT_COLUMN_DEPTH_X))))
-    column_depth_y = max(0.15, min(2.0, float(body.get("column_depth_y", DEFAULT_COLUMN_DEPTH_Y))))
-    beam_depth = max(0.10, min(3.0, float(body.get("beam_depth", DEFAULT_BEAM_DEPTH))))
-    epicenter_distance_km = max(1.0, min(200.0, float(body.get("epicenter_distance_km", DEFAULT_EPICENTER_DISTANCE_KM))))
-    epicenter_depth_km = max(1.0, min(100.0, float(body.get("epicenter_depth_km", DEFAULT_EPICENTER_DEPTH_KM))))
-    richter_magnitude = max(3.0, min(9.0, float(body.get("richter_magnitude", reference_magnitude))))
-    area_sqft = max(200.0, min(2000.0, float(body.get("area_sqft", DEFAULT_AREA_SQFT))))
+    mass_per_floor = max(1e3, min(1e8, number("mass_per_floor", 1000e3)))
+    zeta = max(0.005, min(0.5, number("zeta", 0.05)))
+    column_depth_x = max(0.15, min(2.0, number("column_depth_x", DEFAULT_COLUMN_DEPTH_X)))
+    column_depth_y = max(0.15, min(2.0, number("column_depth_y", DEFAULT_COLUMN_DEPTH_Y)))
+    beam_depth = max(0.10, min(3.0, number("beam_depth", DEFAULT_BEAM_DEPTH)))
+    epicenter_distance_km = max(1.0, min(200.0, number("epicenter_distance_km", DEFAULT_EPICENTER_DISTANCE_KM)))
+    epicenter_depth_km = max(1.0, min(100.0, number("epicenter_depth_km", DEFAULT_EPICENTER_DEPTH_KM)))
+    richter_magnitude = max(3.0, min(9.0, number("richter_magnitude", reference_magnitude)))
+    area_sqft = max(200.0, min(2000.0, number("area_sqft", DEFAULT_AREA_SQFT)))
+    rho_longitudinal = float(body.get("rho_longitudinal", RHO_LONGITUDINAL))
+    if not np.isfinite(rho_longitudinal) or not .01 <= rho_longitudinal <= .06:
+        raise ParamError("rho_longitudinal must be between 0.01 and 0.06")
 
     # --- spec 10 ------------------------------------------------------
     # An unknown section_stiffness_mode falls back to the default rather
@@ -272,7 +334,7 @@ def _validate_params(body, reference_magnitude=6.0):
     # story_height_profile wins -- it is the more specific request.
     story_height = profiles["story_height_profile"]
     if story_height is None:
-        h0 = max(1.5, min(10.0, float(body.get("story_height", 3.5))))
+        h0 = max(1.5, min(10.0, number("story_height", 3.5)))
         if soft_ground_story:
             story_height = [SOFT_STORY_HEIGHT_RATIO * h0] + [h0] * (num_stories - 1)
         else:
@@ -290,6 +352,7 @@ def _validate_params(body, reference_magnitude=6.0):
         "epicenter_depth_km": epicenter_depth_km,
         "richter_magnitude": richter_magnitude,
         "area_sqft": area_sqft,
+        "rho_longitudinal": rho_longitudinal,
         "section_stiffness_mode": mode,
         "p_delta": p_delta,
         "soft_ground_story": soft_ground_story,
@@ -299,6 +362,17 @@ def _validate_params(body, reference_magnitude=6.0):
         "column_depth_y_scalar": column_depth_y,
         "beam_depth_scalar": beam_depth,
     }
+
+
+@app.route("/design", methods=["POST"])
+def design():
+    """Generate an illustrative member profile without changing the building."""
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        inp = DesignInput(**body)
+        return jsonify(generate_design(inp))
+    except (DesignError, TypeError, ValueError, OverflowError) as exc:
+        return jsonify({"error": "invalid_design", "detail": str(exc)}), 400
 
 
 @app.route("/compute", methods=["POST"])
@@ -323,6 +397,14 @@ def compute():
         return jsonify({"error": "invalid_parameter", "detail": str(e)}), 400
 
     num_stories = p["num_stories"]
+    analysis_trace = body.get("analysis_trace")
+    if analysis_trace is not None:
+        if (not isinstance(analysis_trace, dict)
+                or analysis_trace.get("axis") not in ("X", "Y")
+                or type(analysis_trace.get("floor")) is not int
+                or not 0 <= analysis_trace["floor"] < num_stories):
+            return jsonify({"error": "invalid_parameter",
+                            "detail": "analysis_trace requires axis X/Y and a zero-based floor"}), 400
     mass_per_floor = p["mass_per_floor"]
     zeta = p["zeta"]
     epicenter_distance_km = p["epicenter_distance_km"]
@@ -344,9 +426,12 @@ def compute():
         plan_span_x=plan_span_x, plan_span_y=plan_span_y,
         section_stiffness_mode=p["section_stiffness_mode"],
         p_delta=p["p_delta"],
+        rho_longitudinal=p["rho_longitudinal"],
     )
     torsion = nonlinear_params.pop('torsion')
     has_y = ground.get("Y") is not None
+    if analysis_trace is not None and analysis_trace["axis"] == "Y" and not has_y:
+        return jsonify({"error": "invalid_parameter", "detail": "record has no Y component"}), 400
     b3 = None
     torsion_fallback = None
     try:
@@ -520,6 +605,7 @@ def compute():
         # the header length it reads back).
         "story_heights": building_x.h.tolist(),
         "section_stiffness_mode": p["section_stiffness_mode"],
+        "rho_longitudinal": p["rho_longitudinal"],
         "cracked_factor_column": building_x.cracked_factor_column,
         "cracked_factor_beam": building_x.cracked_factor_beam,
         "p_delta_enabled": p["p_delta"],
@@ -605,6 +691,10 @@ def compute():
         header['collapse'].update(handoff_header(
             b3 if b3 is not None else building_x,
             None if b3 is not None or not has_y else building_y))
+    if analysis_trace is not None:
+        header["analysis_trace"] = dict(axis=analysis_trace["axis"],
+                                        floor=analysis_trace["floor"],
+                                        dtype="float64", npts=len(time_arr))
     # Spec 14 R5: the per-story column depths actually built, echoed only
     # when a profile was sent, so a no-profile payload stays byte-identical.
     for axis in ("x", "y"):
@@ -686,6 +776,28 @@ def compute():
             header[f"mode_shapes_{axis}"] = b3.phi[k*N:(k+1)*N][:, sel].tolist()
             header[f"fundamental_period_s_{axis}"] = float(1 / freqs[sel][0])
             header[f"participation_factors_{axis}"] = gamma[sel].tolist()
+    if nonlinear and body.get("analysis_identity") is True:
+        if header['collapse'].get('detachment_events'):
+            header['identity'] = dict(available=False,
+                reason='The modal operator changes at detachment; no single-run identity is plotted.')
+        elif not header['collapse']['converged']:
+            header['identity'] = dict(available=False,
+                reason='The fixed-point solve did not converge.')
+        elif b3 is not None:
+            header['identity'] = dict(available=True, **_identity_spectra(
+                b3, b3.hftd_result, {'X': 0, 'Y': num_stories},
+                nonlinear_params['hftd_segment_seconds']))
+        else:
+            spectra = [_identity_spectra(building_x, building_x.hftd_result, {'X': 0},
+                                         nonlinear_params['hftd_segment_seconds'])]
+            if has_y:
+                spectra.append(_identity_spectra(building_y, building_y.hftd_result, {'Y': 0},
+                                                 nonlinear_params['hftd_segment_seconds']))
+            header['identity'] = dict(available=True, f_Hz=spectra[0]['f_Hz'],
+                axes={axis: curves for item in spectra for axis, curves in item['axes'].items()},
+                complex_residual=max(item['complex_residual'] for item in spectra),
+                elastic_discrepancy=max(item['elastic_discrepancy'] for item in spectra),
+                sampling_factor=max(item['sampling_factor'] for item in spectra))
     header_bytes = json.dumps(header, allow_nan=False).encode("utf-8")
     # Float32Array requires its byte offset to be a multiple of 4, but the
     # JSON header's length isn't guaranteed to be -- pad with zero bytes so
@@ -722,6 +834,16 @@ def compute():
     for a in damage_arrays.values():
         parts.append(a.tobytes())
         parts.append(b"\x00" * ((-a.nbytes) % 4))
+
+    # Optional exact relative-floor trace for the on-demand superposition
+    # experiment. The normal animation stays float32; this appendix is only
+    # requested when the numerical comparison needs the solver's precision.
+    if analysis_trace is not None:
+        used = sum(len(part) for part in parts)
+        parts.append(b"\x00" * ((-used) % 8))
+        b = building_x if analysis_trace["axis"] == "X" else building_y
+        parts.append(np.asarray(b.floor_disp_rel[analysis_trace["floor"]],
+                                dtype="<f8").tobytes())
 
     return Response(b"".join(parts), mimetype="application/octet-stream")
 
