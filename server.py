@@ -4,7 +4,7 @@ Parameters sliders.
 
 This is a trimmed mirror of the main project's server.py, deployed
 separately (Render) since GitHub Pages can only serve static files and
-can't run this Flask app itself. It exposes only POST /compute and POST /design -- the
+can't run this Flask app itself. It exposes only POST /compute, POST /cancel and POST /design -- the
 frontend (served from GitHub Pages) fetches everything else (index.html,
 out/*.json, out/*.csv, folders.json) directly from Pages, same-origin,
 with no involvement from this backend at all.
@@ -24,6 +24,7 @@ Local test: python server.py
 import json
 import os
 import struct
+import threading
 
 import numpy as np
 from flask import Flask, Response, jsonify, request
@@ -44,6 +45,7 @@ from mdof_response import (
     subsample_nearest, DAMAGE_CODES, DAMAGE_CODE_OF_BRANCH,
     DRIFT_LIMIT_IO, DRIFT_LIMIT_LS,
     _HFTDConvolution, RHO_LONGITUDINAL,
+    AnalysisCancelled, set_cancel_event,
 )
 
 # Spec 14 A1: optional per-story damage blocks, in WIRE order -- every
@@ -66,8 +68,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(PROJECT_ROOT, "out")
 
 app = Flask(__name__, static_folder=None)
-CORS(app, resources={r"/(compute|design)": {"origins": "https://nekrei.github.io",
-                                           "methods": ["POST", "OPTIONS"]}})
+CORS(app, resources={r"/(compute|design|cancel)": {"origins": "https://nekrei.github.io",
+                                                  "methods": ["POST", "OPTIONS"]}})
 
 # Ground motion (acceleration + displacement) doesn't change with building
 # parameters, so cache each record's parsed ground_accel.json in memory
@@ -375,9 +377,40 @@ def design():
         return jsonify({"error": "invalid_design", "detail": str(exc)}), 400
 
 
+# Runs the browser can cancel: run_id -> Event polled by the solver loops.
+# Aborting the fetch alone would leave this thread solving for minutes and
+# competing with the next run.
+_RUNS = {}
+
+
+@app.route("/cancel", methods=["POST"])
+def cancel():
+    run_id = (request.get_json(force=True, silent=True) or {}).get("run_id")
+    event = _RUNS.get(run_id) if isinstance(run_id, str) else None
+    if event is not None:
+        event.set()
+    return jsonify({"cancelled": event is not None})
+
+
 @app.route("/compute", methods=["POST"])
 def compute():
     body = request.get_json(force=True, silent=True) or {}
+    run_id = body.get("run_id")
+    event = threading.Event()
+    if isinstance(run_id, str):
+        _RUNS[run_id] = event
+    set_cancel_event(event)
+    try:
+        return _compute(body)
+    except AnalysisCancelled:
+        return jsonify({"error": "cancelled"}), 499
+    finally:
+        if isinstance(run_id, str):
+            _RUNS.pop(run_id, None)
+        set_cancel_event(None)
+
+
+def _compute(body):
     record = body.get("record")
     if not record:
         return jsonify({"error": "record is required"}), 400

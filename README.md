@@ -11,6 +11,8 @@ building-response solver (`mdof_response.py`) as the main project, against
 a cached earthquake record, for user-chosen building and earthquake
 parameters. `POST /design` runs the educational code-design generator
 (`code_design.py`) that proposes per-floor sizes for the Code design mode.
+`POST /cancel {"run_id": ...}` stops a nonlinear `/compute` that was sent
+with the same `run_id` (it returns HTTP 499 at its next solver iteration).
 
 **This repo has no frontend, no offline data pipeline, and nothing to run
 locally beyond testing `/compute` directly.** For the full project — the
@@ -19,7 +21,7 @@ pipeline — see [nekrei/Seismic-Sim](https://github.com/nekrei/Seismic-Sim).
 
 ## Files
 
-- `server.py` — the Flask app, trimmed to `/compute` and `/design` (no
+- `server.py` — the Flask app, trimmed to `/compute`, `/cancel` and `/design` (no
   static-file serving — that's Pages' job).
 - `mdof_response.py` — the physics engine (`MDOF_ShearBuilding`), an
   unmodified copy of the main project's file.
